@@ -7,3 +7,9 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      # Free and starter instances have 512 MB. Chrome then runs as one
+      # renderer and skips images, fonts, and media.
+      - key: LOW_MEM
+        value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"

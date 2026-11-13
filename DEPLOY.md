@@ -66,7 +66,9 @@ chromium`) will keep failing with "Install Google Chrome".
 1. Push this repo to GitHub.
 2. Render → **New → Web Service** → connect the repo.
 3. Environment: **Docker** (auto-detects `Dockerfile`). Do **not** use native Python.
-4. Instance: **Standard (2 GB)** if you can. Free/Starter 512 MB often kills Chrome.
+4. Instance: Free or Starter (512 MB) is enough. `LOW_MEM=1` (set in `render.yaml`)
+   keeps Chrome to one renderer and skips images, fonts, and media. A 2 GB
+   instance is only worth it if the logs show the process was killed for memory.
 5. Deploy. Render injects `PORT`; `serve.py` already reads it.
 
 If the service already exists as native Python, open **Settings → Build & Deploy**

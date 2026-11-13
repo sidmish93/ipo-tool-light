@@ -43,6 +43,26 @@ _BROWSER_ARGS = [
     "--disable-gpu",
     "--disable-extensions",
 ]
+# Render free/starter instances have 512 MB for Python and Chrome together.
+# One renderer and no site-isolation keeps BSE + NSE from spawning a
+# process each. Images are blocked separately in the browser context.
+_LOW_MEM_ARGS = [
+    "--renderer-process-limit=1",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-translate",
+    "--disable-component-update",
+    "--disable-hang-monitor",
+    "--mute-audio",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disk-cache-size=1",
+    "--media-cache-size=1",
+    "--js-flags=--max-old-space-size=96",
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,"
+    "OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process",
+]
 _STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
 
 
@@ -113,10 +133,58 @@ def _can_open_window():
     return bool(os.environ.get("DISPLAY"))
 
 
+def _cgroup_memory_limit():
+    """Container memory cap in bytes, or None when the host has no cap."""
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = open(path, encoding="ascii").read().strip()
+        except OSError:
+            continue
+        if raw.isdigit():
+            value = int(raw)
+            if 0 < value < 1 << 60:
+                return value
+    return None
+
+
+def _low_memory():
+    """True on a 512 MB host (Render free/starter) or when LOW_MEM=1.
+
+    LOW_MEM=0 forces the full browser even on Render.
+    """
+    flag = (os.environ.get("LOW_MEM") or "").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if (os.environ.get("RENDER") or "").strip().lower() == "true":
+        return True
+    limit = _cgroup_memory_limit()
+    return limit is not None and limit <= 768 * 1024 * 1024
+
+
+def _browser_args():
+    args = list(_BROWSER_ARGS)
+    if _low_memory():
+        args.extend(_LOW_MEM_ARGS)
+    return args
+
+
+def _block_heavy_resources(ctx):
+    """Drop images, fonts, and media. JSON fetches do not need them."""
+    def _handle(route):
+        if route.request.resource_type in ("image", "media", "font"):
+            route.abort()
+        else:
+            route.continue_()
+    ctx.route("**/*", _handle)
+
+
 def _browser_specs():
     """Launch recipes. Real Chrome/Edge only — bundled Chromium is blocked by BSE."""
     common = {
-        "args": _BROWSER_ARGS,
+        "args": _browser_args(),
         "ignore_default_args": ["--enable-automation"],
     }
     specs = []
@@ -139,12 +207,15 @@ def _browser_specs():
 
 
 def _new_context(browser):
+    low = _low_memory()
     ctx = browser.new_context(
         user_agent=UA,
-        viewport={"width": 1440, "height": 900},
+        viewport={"width": 1100 if low else 1440, "height": 700 if low else 900},
         locale="en-IN",
         extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"},
     )
+    if low:
+        _block_heavy_resources(ctx)
     ctx.add_init_script(_STEALTH_JS)
     ctx.set_default_timeout(60000)
     return ctx
@@ -181,6 +252,9 @@ def _open_session(playwright):
     Returns (browser, context, label).
     """
     errors = []
+    if _low_memory():
+        print("Low-memory browser mode (512 MB): one Chrome renderer, "
+              "images/fonts/media blocked.", flush=True)
     for spec in _browser_specs():
         try:
             browser = playwright.chromium.launch(**spec["launch"])
