@@ -66,7 +66,8 @@
     display:inline-block; margin-top:12px; background:var(--ok); color:#04121c;
     padding:12px 22px; border-radius:10px; font-weight:700; text-decoration:none;
   }
-  h2{font-size:19px; margin:0 0 16px}
+  h2{font-size:19px; margin:0 0 6px}
+  .lead{color:var(--muted); font-size:14px; margin:0 0 16px; line-height:1.45}
   .spinner{display:inline-block; width:15px; height:15px; border:2px solid var(--line);
     border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;
     vertical-align:-2px; margin-right:8px}
@@ -94,6 +95,7 @@
     <h1>Shareholding Excel Generator</h1>
 
     <div class="card">
+      <p class="lead">Generates the shareholding pattern for companies listed between two dates.</p>
       <div class="row">
         <div class="field">
           <label for="from">Start date</label>
@@ -116,6 +118,7 @@
 
     <div class="card">
       <h2>Look up companies</h2>
+      <p class="lead">Generates the shareholding pattern for the specific companies you search for.</p>
       <div class="row">
         <div class="field" style="flex:3">
           <label for="q">Company names, separated by a semicolon</label>
