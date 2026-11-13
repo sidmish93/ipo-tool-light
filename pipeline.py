@@ -481,6 +481,20 @@ def _one_shareholder(row):
         return True
 
 
+def _category_label(name):
+    """Category captions BSE sometimes stores in the shareholder-name field.
+
+    A count of 1 does not make these a person or a company. 'Unclaimed or
+    Suspense or Escrow Account' is often split into several such rows.
+    """
+    key = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    if "unclaimed" in key and ("escrow" in key or "suspense" in key):
+        return True
+    if key.startswith("independent director") and "relative" in key:
+        return True
+    return False
+
+
 def _to_float(txt):
     if txt is None:
         return None
@@ -1006,10 +1020,11 @@ class Pipeline:
         nm = re.sub(r"\s+", " ", (x.get("Fld_ShareHolderName") or "").strip())
         pct = _to_float(x.get("Fld_TotalPercentageOf_A_B_C2"))
         shares = _to_float(x.get("Fld_TotalNoOfShares"))
-        # HUF, LLP, Clearing Members and a Bodies Corporate total are
-        # category buckets: BSE gives them a label and a holder count above 1.
-        # A company inside Bodies Corporate has a count of 1 and stays.
-        if not nm or pct is None or pct <= 0 or not _one_shareholder(x):
+        # Category captions (HUF, Clearing Members, an Unclaimed/Suspense/
+        # Escrow row, Independent Director or his relatives) are not holders.
+        # A named company or person, including one inside Bodies Corporate, stays.
+        if (not nm or pct is None or pct <= 0 or not _one_shareholder(x)
+                or _category_label(nm)):
             return None
         return {
             "name": nm,
