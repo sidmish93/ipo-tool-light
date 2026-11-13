@@ -259,6 +259,69 @@ def _bse_reachable(ctx) -> bool:
             pass
 
 
+class _HttpPage:
+    """Stand-in for a Playwright page. BSE's API rejects plain Python
+    HTTP, but accepts Chrome's TLS fingerprint, so a 512 MB Render box
+    never has to start Chrome.
+    """
+
+    def __init__(self, session, referer):
+        self.session = session
+        self.referer = referer
+        self.url = referer
+
+    def title(self):
+        return ""
+
+    def close(self):
+        return None
+
+    def wait_for_timeout(self, _ms):
+        return None
+
+    def goto(self, url, **_kwargs):
+        self.url = url
+        self.referer = url
+        try:
+            self.session.get(url, headers=self._headers(), timeout=30)
+        except Exception:
+            pass
+
+    def _headers(self):
+        parts = urllib.parse.urlparse(self.referer)
+        return {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": self.referer,
+            "Origin": f"{parts.scheme}://{parts.netloc}",
+            "Accept-Language": "en-IN,en;q=0.9",
+        }
+
+    def evaluate(self, _script, url=None):
+        if not url:
+            return {"ok": False, "status": 0, "text": ""}
+        try:
+            response = self.session.get(url, headers=self._headers(), timeout=40)
+            text = response.text or ""
+            parsed = None
+            try:
+                parsed = response.json()
+            except Exception:
+                parsed = None
+            return {
+                "ok": response.status_code < 400,
+                "status": response.status_code,
+                "text": text,
+                "json": parsed,
+            }
+        except Exception as exc:
+            return {"ok": False, "status": 0, "text": str(exc)}
+
+
+def _http_session():
+    from curl_cffi import requests as chrome_http
+    return chrome_http.Session(impersonate="chrome")
+
+
 def _driver_died(exc):
     msg = str(exc).lower()
     return ("connection closed" in msg or "target closed" in msg
@@ -1048,28 +1111,22 @@ class Pipeline:
         return promoters, public, meta
 
     def _lookup_many_light(self, terms):
-        """Search with one Chrome page. BSE and NSE are never open together."""
+        """Search without Chrome. The exchange APIs are read with Chrome's
+        TLS fingerprint, which fits in 512 MB."""
+        session = _http_session()
+        bpage = _HttpPage(session, "https://www.bseindia.com/")
+        npage = _HttpPage(session, "https://www.nseindia.com/")
+        bpage.goto("https://www.bseindia.com/")
+        npage.goto("https://www.nseindia.com/")
+        self.log("Reading BSE and NSE directly (Chrome stays closed).",
+                 stage="bse")
         out = []
-        with sync_playwright() as p:
-            browser, ctx, label = _open_session(p, probe=False)
-            self.log(f"Browser: {label}", stage="bse")
-            try:
-                page = ctx.new_page()
-                total = len(terms)
-                for i, name in enumerate(terms, 1):
-                    self.log(f"[{i}/{total}] {name}", current=i, total=total,
-                             stage="bse")
-                    out.append(self._record_one(page, name))
-                return out
-            finally:
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+        total = len(terms)
+        for i, name in enumerate(terms, 1):
+            self.log(f"[{i}/{total}] {name}", current=i, total=total,
+                     stage="bse")
+            out.append(self._lookup_on_pages(bpage, npage, name))
+        return out
 
     # ----- orchestration -------------------------------------------------- #
     def run(self, dfrom, dto, out_path, mcap_min=None):
@@ -1183,55 +1240,44 @@ class Pipeline:
         return qualified
 
     def _run_light(self, dfrom, dto, out_path, threshold):
-        """Same workbook as run(), but Chrome only has one page open."""
+        """Same workbook as run(), without starting Chrome."""
         qualified = []
-        with sync_playwright() as p:
+        session = _http_session()
+        self._check_cancel()
+        self.log("Fetching mainboard IPOs by listing date (Chittorgarh)...",
+                 stage="list")
+        companies = self._listed_companies(
+            _HttpPage(session, CHITTOR_HOME), dfrom, dto)
+        self.log(f"Found {len(companies)} listed IPOs in range.", stage="list")
+        self.log(f"Keeping companies with mcap > {threshold:.0f} cr.",
+                 stage="bse")
+        bpage = _HttpPage(session, "https://www.bseindia.com/")
+        npage = _HttpPage(session, "https://www.nseindia.com/")
+        bpage.goto("https://www.bseindia.com/")
+        npage.goto("https://www.nseindia.com/")
+        total = len(companies)
+        for i, (name, _dt) in enumerate(companies, 1):
             self._check_cancel()
-            browser, ctx, label = _open_session(p, probe=False)
-            self.log(f"Browser: {label}", stage="list")
-            try:
-                page = ctx.new_page()
-                self.log("Fetching mainboard IPOs by listing date "
-                         "(Chittorgarh)...", stage="list")
-                companies = self._listed_companies(page, dfrom, dto)
-                self.log(f"Found {len(companies)} listed IPOs in range.",
-                         stage="list")
-                self.log(f"Keeping companies with mcap > {threshold:.0f} cr.",
+            self.log(f"[{i}/{total}] {name}", current=i, total=total,
+                     stage="bse")
+            rec = self._lookup_on_pages(bpage, npage, name)
+            if not rec.get("found"):
+                self.log("    not found on BSE, skipping", stage="bse")
+                continue
+            mcap = rec.get("mcap")
+            if mcap is None or mcap <= threshold:
+                self.log(f"    Mcap {mcap} <= {threshold:.0f}cr, skipping",
                          stage="bse")
-                total = len(companies)
-                for i, (name, _dt) in enumerate(companies, 1):
-                    self._check_cancel()
-                    self.log(f"[{i}/{total}] {name}", current=i, total=total,
-                             stage="bse")
-                    rec = self._record_one(page, name)
-                    if rec.get("error") and not rec.get("found"):
-                        self.log(f"    {rec['error']}", stage="bse")
-                    if not rec.get("found"):
-                        self.log("    not found on BSE, skipping", stage="bse")
-                        continue
-                    mcap = rec.get("mcap")
-                    if mcap is None or mcap <= threshold:
-                        self.log(f"    Mcap {mcap} <= {threshold:.0f}cr, skipping",
-                                 stage="bse")
-                        continue
-                    if not rec.get("quarter"):
-                        self.log("    no shareholding quarter, skipping", stage="bse")
-                        continue
-                    rec["name"] = name
-                    qualified.append(rec)
-                    self.log(f"    QUALIFIED  Mcap {mcap:,.2f}cr  {rec.get('bse_ticker')}  "
-                             f"(promoters={len(rec.get('promoters') or [])}, "
-                             f"public={len(rec.get('public') or [])})",
-                             stage="bse")
-            finally:
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                continue
+            if not rec.get("quarter"):
+                self.log("    no shareholding quarter, skipping", stage="bse")
+                continue
+            rec["name"] = name
+            qualified.append(rec)
+            self.log(f"    QUALIFIED  Mcap {mcap:,.2f}cr  {rec.get('bse_ticker')}  "
+                     f"(promoters={len(rec.get('promoters') or [])}, "
+                     f"public={len(rec.get('public') or [])})",
+                     stage="bse")
         self.log("Writing Excel workbook...", stage="excel")
         cut = int(threshold) if threshold == int(threshold) else threshold
         _write_workbook(qualified, out_path,
