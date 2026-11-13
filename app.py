@@ -64,7 +64,8 @@ def _found_companies(results):
 def _reset():
     _job.update(running=False, log=[], current=0, total=0, stage="",
                 finished=False, error=None, file=None, count=None,
-                cancelled=False)
+                cancelled=False, kind=None, results=None, queries=None,
+                missing=None)
 
 
 def _progress(msg, current=None, total=None, stage=None):
@@ -113,6 +114,30 @@ def _worker(from_str, to_str, mcap_min):
         _gate.release()
 
 
+def _lookup_worker(q):
+    try:
+        results = lookup_company(q, progress_cb=_progress,
+                                 cancel_cb=_cancel.is_set)
+        _last_lookup["key"] = _lookup_key(q)
+        _last_lookup["results"] = results
+        _job["results"] = results
+        _job["queries"] = split_terms(q)
+        _job["missing"] = [r.get("query") for r in results if not r.get("found")]
+        _job["count"] = sum(1 for r in results if r.get("found"))
+        _progress(f"Done. {_job['count']} found.", stage="done")
+    except Cancelled:
+        _job["cancelled"] = True
+        _progress("Cancelled.")
+    except Exception as e:
+        _job["error"] = _browser_error(e)
+        _progress("ERROR: " + _job["error"])
+        traceback.print_exc()
+    finally:
+        _job["finished"] = True
+        _job["running"] = False
+        _gate.release()
+
+
 @app.route("/")
 def index():
     if not _job.get("running") and _job.get("cancelled"):
@@ -145,6 +170,7 @@ def start():
     _reset()
     _cancel.clear()
     _job["running"] = True
+    _job["kind"] = "generate"
     _job["mcap_min"] = mcap_min
 
     threading.Thread(target=_worker, args=(from_str, to_str, mcap_min),
@@ -159,28 +185,17 @@ def company():
     terms = split_terms(q)
     if not terms:
         return jsonify({"error": "Please enter a company name."}), 400
-    if len(terms) > 15:
-        return jsonify({"error": "Please look up at most 15 companies at once."}), 400
 
     if not _gate.acquire(blocking=False):
         return jsonify({"error": "Server is busy (a generation or lookup is "
                                  "running). Please try again shortly."}), 409
-    try:
-        results = lookup_company(q)
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": _browser_error(e)}), 500
-    finally:
-        _gate.release()
-    _last_lookup["key"] = _lookup_key(q)
-    _last_lookup["results"] = results
-    return jsonify({
-        "ok": True,
-        "queries": terms,
-        "results": results,
-        "found_count": sum(1 for r in results if r.get("found")),
-        "missing": [r["query"] for r in results if not r.get("found")],
-    })
+    _reset()
+    _cancel.clear()
+    _job["running"] = True
+    _job["kind"] = "lookup"
+    _job["queries"] = terms
+    threading.Thread(target=_lookup_worker, args=(q,), daemon=True).start()
+    return jsonify({"ok": True, "queries": terms})
 
 
 @app.route("/company.xlsx", methods=["POST"])
@@ -190,25 +205,14 @@ def company_xlsx():
     terms = split_terms(q)
     if not terms:
         return jsonify({"error": "Please enter a company name."}), 400
-    if len(terms) > 15:
-        return jsonify({"error": "Please look up at most 15 companies at once."}), 400
 
     key = _lookup_key(q)
+    if _job.get("running") and _job.get("kind") == "lookup":
+        return jsonify({"error": "Search is still running."}), 409
     if _last_lookup["key"] == key and _last_lookup["results"]:
         results = _last_lookup["results"]
     else:
-        if not _gate.acquire(blocking=False):
-            return jsonify({"error": "Server is busy (a generation or lookup is "
-                                     "running). Please try again shortly."}), 409
-        try:
-            results = lookup_company(q)
-        except Exception as e:
-            traceback.print_exc()
-            return jsonify({"error": _browser_error(e)}), 500
-        finally:
-            _gate.release()
-        _last_lookup["key"] = key
-        _last_lookup["results"] = results
+        return jsonify({"error": "Search these companies first, then download."}), 400
 
     found = _found_companies(results)
     if not found:
@@ -246,6 +250,14 @@ def status():
         "count": _job["count"],
         "mcap_min": _job.get("mcap_min"),
         "cancelled": _job.get("cancelled"),
+        "kind": _job.get("kind"),
+        "queries": _job.get("queries"),
+        "missing": _job.get("missing"),
+        "found_count": _job.get("count") if _job.get("kind") == "lookup" else None,
+        "results": (_job.get("results") or [])
+                   if (_job.get("kind") == "lookup" and _job.get("finished")
+                       and not _job.get("running"))
+                   else None,
     })
 
 

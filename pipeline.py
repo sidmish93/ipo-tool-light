@@ -1184,12 +1184,13 @@ class Pipeline:
         bpage.goto("https://www.bseindia.com/")
         npage.goto("https://www.nseindia.com/")
         self.log("Reading BSE and NSE directly (Chrome stays closed).",
-                 stage="bse")
+                 stage="lookup")
         out = []
         total = len(terms)
         for i, name in enumerate(terms, 1):
+            self._check_cancel()
             self.log(f"[{i}/{total}] {name}", current=i, total=total,
-                     stage="bse")
+                     stage="lookup")
             out.append(self._lookup_on_pages(bpage, npage, name))
         return out
 
@@ -1442,8 +1443,9 @@ class Pipeline:
                 out = []
                 total = len(terms)
                 for i, name in enumerate(terms, 1):
+                    self._check_cancel()
                     self.log(f"[{i}/{total}] {name}", current=i, total=total,
-                             stage="bse")
+                             stage="lookup")
                     out.append(self._lookup_on_pages(bpage, npage, name))
                     bpage.wait_for_timeout(150)
                 npage.close()
@@ -1645,7 +1647,7 @@ def run_pipeline(from_str, to_str, out_path, progress_cb=None, mcap_min=None,
         dfrom, dto, out_path, mcap_min=mcap_min)
 
 
-def lookup_company(name):
+def lookup_company(name, progress_cb=None, cancel_cb=None):
     """Interactive lookup. `name` may be several companies separated by ';'."""
     terms = split_terms(name)
-    return Pipeline().lookup_many(terms)
+    return Pipeline(progress_cb, cancel_cb).lookup_many(terms)

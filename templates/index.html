@@ -118,9 +118,9 @@
       <h2>Look up companies</h2>
       <div class="row">
         <div class="field" style="flex:3">
-          <label for="q">Company name(s)</label>
+          <label for="q">Company names, separated by a semicolon</label>
           <input type="text" id="q"
-                 placeholder="e.g. Delhivery; Lodha Developers; Vedanta"
+                 placeholder="Delhivery; Lodha Developers; Vedanta"
                  autocomplete="off">
         </div>
         <div class="field" style="flex:0 0 auto; display:flex; align-items:flex-end; gap:10px">
@@ -225,6 +225,7 @@ $("#cancel").addEventListener("click", async () => {
   try{
     const s = await (await fetch("/status")).json();
     if(s.running) watchJob();
+    else if(s.kind === "lookup" && s.finished && s.results) paintLookup(s);
     else hideProgress();
   }catch(e){}
 })();
@@ -241,6 +242,8 @@ async function refresh(){
   }
   $("#pw").style.display = "block";
   $("#go").disabled = !!s.running;
+  $("#search").disabled = !!s.running;
+  $("#dlLookup").disabled = !!s.running;
   $("#cancel").style.display = s.running ? "inline-block" : "none";
   $("#cancel").disabled = !s.running;
   $("#log").textContent = (s.log || []).join("\n");
@@ -249,6 +252,7 @@ async function refresh(){
   const cut = (s.mcap_min == null || s.mcap_min === "") ? 3000 : s.mcap_min;
   const stageNames = {list:"Reading IPO listings", sebi:"Reading SEBI filings",
     bse:`Filtering on BSE (mcap > ${cut}cr)`,
+    lookup:"Looking up companies",
     detail:"Extracting detailed shareholding", excel:"Writing Excel", done:"Done"};
   let stage = stageNames[s.stage] || "Working";
   if(s.total){
@@ -261,8 +265,22 @@ async function refresh(){
   if(s.finished){
     if(poll){ clearInterval(poll); poll = null; }
     $("#go").disabled = false;
+    $("#search").disabled = false;
+    $("#dlLookup").disabled = false;
     $("#cancel").style.display = "none";
     $("#cancel").textContent = "Cancel";
+    if(s.kind === "lookup"){
+      $("#barfill").style.width = "100%";
+      $("#stage").innerHTML = "<b>Done</b>";
+      if(s.cancelled){
+        $("#lookStatus").textContent = "Cancelled.";
+      } else if(s.error){
+        $("#lookStatus").textContent = "Failed: " + s.error;
+      } else {
+        paintLookup(s);
+      }
+      return;
+    }
     if(s.cancelled){
       $("#result").className = "result err";
       $("#result").textContent = "Cancelled.";
@@ -299,6 +317,23 @@ const fmtAdj = (v, kind) => {
   return fmtSh(v);
 };
 
+function paintLookup(d){
+  const rows = d.results || [];
+  const crashed = rows.filter(r => r.error && !r.found);
+  if(!d.found_count && crashed.length){
+    $("#lookStatus").textContent = crashed.map(r => r.error).join("; ");
+    $("#lookCard").style.display = "none";
+    return;
+  }
+  const missing = d.missing || [];
+  const found = d.found_count || 0;
+  $("#lookStatus").textContent = missing.length
+    ? `Found ${found} of ${rows.length}. No BSE match for: ${missing.join("; ")}`
+    : (found > 1 ? `Found ${found} companies.` : "");
+  $("#lookCard").innerHTML = rows.map(renderCompanyBlock).join("");
+  $("#lookCard").style.display = rows.length ? "block" : "none";
+}
+
 async function doSearch(){
   const q = $("#q").value.trim();
   if(!q){ $("#lookStatus").textContent = "Please enter a company name."; return; }
@@ -307,37 +342,26 @@ async function doSearch(){
   $("#dlLookup").disabled = true;
   $("#lookCard").style.display = "none";
   $("#lookCard").innerHTML = "";
-  const wait = n > 1
-    ? `Searching BSE / NSE for ${n} companies — about ${n * 20}s…`
-    : `Searching BSE / NSE for “${esc(q)}” — this takes ~15-30s…`;
-  $("#lookStatus").innerHTML = `<span class="spinner"></span>${wait}`;
+  $("#lookStatus").innerHTML = `<span class="spinner"></span>Looking up ${n} compan${n===1?"y":"ies"}…`;
   try{
     const r = await fetch("/company", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({q})
     });
     const d = await r.json();
-    if(!r.ok){ $("#lookStatus").textContent = d.error || "Lookup failed."; return; }
-    const rows = d.results || [];
-    if(!rows.length){
-      $("#lookStatus").textContent = "No companies to look up.";
+    if(!r.ok){
+      $("#lookStatus").textContent = d.error || "Lookup failed.";
+      $("#search").disabled = false;
+      $("#dlLookup").disabled = false;
       return;
     }
-    const crashed = rows.filter(r => r.error && !r.found);
-    if(!d.found_count && crashed.length){
-      $("#lookStatus").textContent = crashed.map(r => r.error).join("; ");
-      return;
-    }
-    const missing = d.missing || [];
-    const found = d.found_count || 0;
-    $("#lookStatus").textContent = missing.length
-      ? `Found ${found} of ${rows.length}. No BSE match for: ${missing.join("; ")}`
-      : (found > 1 ? `Found ${found} companies.` : "");
-    $("#lookCard").innerHTML = rows.map(renderCompanyBlock).join("");
-    $("#lookCard").style.display = "block";
+    showProgress();
+    $("#log").textContent = "";
+    $("#cancel").style.display = "inline-block";
+    $("#cancel").disabled = false;
+    watchJob();
   }catch(e){
     $("#lookStatus").textContent = "Lookup failed: " + e;
-  }finally{
     $("#search").disabled = false;
     $("#dlLookup").disabled = false;
   }
