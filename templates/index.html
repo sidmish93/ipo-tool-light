@@ -423,9 +423,9 @@ function holderOf(rw){
 }
 
 function tableHTML(title, rows){
-  const headers = ["Name", "Category", "Shares (SHP)", "SHP %", "Holding (Rs Cr.)",
+  const headers = ["Name", "Category", "Shares (SHP)", "SHP % (A+B+C2)", "Holding (Rs Cr.)",
                    "Bought after SHP", "Sold after SHP",
-                   "Adj. shares", "Adj. %", "Adj. holding (Rs Cr.)"];
+                   "Adj. shares", "Adj. % (A+B+C2)", "Adj. holding (Rs Cr.)"];
   if(!rows || !rows.length){
     return `<div class="tbl-title">${title}</div>
             <div class="empty">No qualifying rows (&gt; 0%) for this quarter.</div>`;

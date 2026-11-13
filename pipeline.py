@@ -441,6 +441,46 @@ def _bse_search_queries(name):
     return out
 
 
+def _shp_share_bases(payload):
+    """Grand Total (A+B+C) and the A+B+C2 count BSE's percentages use.
+
+    C1, shares underlying DRs, is inside the Grand Total and outside the
+    percentage base. When C1 is zero the two counts are equal.
+    """
+    if not isinstance(payload, dict):
+        return None, None
+    grand = c1 = None
+    for rows in payload.values():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("Fld_ShortName") or "").strip().lower()
+            shares = _to_float(row.get("Fld_TotalNoOfShares")) or 0
+            if name == "grand total" and shares > 0:
+                grand = int(round(shares))
+            elif "(c1)" in name or "underlying dr" in name:
+                c1 = int(round(shares))
+    if not grand:
+        return None, None
+    base = grand - (c1 or 0)
+    if base <= 0:
+        base = grand
+    return grand, base
+
+
+def _one_shareholder(row):
+    """True for a named holder. Category buckets count more than one holder."""
+    raw = row.get("Fld_NoOfShareHolders")
+    if raw in (None, ""):
+        return True
+    try:
+        return int(float(str(raw).replace(",", ""))) == 1
+    except (TypeError, ValueError):
+        return True
+
+
 def _to_float(txt):
     if txt is None:
         return None
@@ -893,8 +933,11 @@ class Pipeline:
         qname = row.get("Fld_qtrname") or ""
         if qid is None:
             return None
+        outstanding, pct_base = _shp_share_bases(res.get("json"))
         return {"qid": qid, "qname": qname,
-                "as_of": _quarter_end_date(qname)}
+                "as_of": _quarter_end_date(qname),
+                "shares_outstanding": outstanding,
+                "pct_base": pct_base}
 
     # ----- NSE ------------------------------------------------------------ #
     def _nse_ticker(self, npage, name, bse_name, fallback):
@@ -963,7 +1006,10 @@ class Pipeline:
         nm = re.sub(r"\s+", " ", (x.get("Fld_ShareHolderName") or "").strip())
         pct = _to_float(x.get("Fld_TotalPercentageOf_A_B_C2"))
         shares = _to_float(x.get("Fld_TotalNoOfShares"))
-        if not nm or pct is None or pct <= 0:
+        # HUF, LLP, Clearing Members and a Bodies Corporate total are
+        # category buckets: BSE gives them a label and a holder count above 1.
+        # A company inside Bodies Corporate has a count of 1 and stays.
+        if not nm or pct is None or pct <= 0 or not _one_shareholder(x):
             return None
         return {
             "name": nm,
@@ -1015,7 +1061,8 @@ class Pipeline:
                        public, mcap):
         holders = list(promoters) + list(public)
         _, extras, meta = fetch_and_adjust(
-            bpage, npage, nse, scripcode, qtr.get("qname"), holders, mcap)
+            bpage, npage, nse, scripcode, qtr.get("qname"), holders, mcap,
+            qtr.get("shares_outstanding"), qtr.get("pct_base"))
         if extras:
             public = list(public) + extras
         return promoters, public, meta
@@ -1081,7 +1128,8 @@ class Pipeline:
         if qtr:
             promoters, public, meta = self._apply_legs(
                 promoters, public, list(bse_legs) + list(nse_legs),
-                qtr["qname"], mcap)
+                qtr["qname"], mcap, qtr.get("shares_outstanding"),
+                qtr.get("pct_base"))
 
         return {
             "found": True,
@@ -1103,9 +1151,11 @@ class Pipeline:
             "public": public,
         }
 
-    def _apply_legs(self, promoters, public, legs, qname, mcap):
+    def _apply_legs(self, promoters, public, legs, qname, mcap,
+                    outstanding=None, pct_base=None):
         holders = list(promoters) + list(public)
-        _, extras, meta = adjust_holders(holders, legs, qname, mcap)
+        _, extras, meta = adjust_holders(
+            holders, legs, qname, mcap, outstanding, pct_base)
         if extras:
             public = list(public) + extras
         return promoters, public, meta
@@ -1491,7 +1541,7 @@ def _write_workbook(companies, out_path, sheet1_title="IPO Companies >3000cr"):
           "Promoter Type / Public Heading",
           "Shares (SHP)", "Shareholding % (A+B+C2)", "Holding (Rs Cr.)",
           "Bought after SHP", "Sold after SHP",
-          "Adj. shares", "Adj. %", "Adj. holding (Rs Cr.)"]
+          "Adj. shares", "Adj. % (A+B+C2)", "Adj. holding (Rs Cr.)"]
     prom_fill = PatternFill("solid", fgColor="E2EFDA")
     pub_fill = PatternFill("solid", fgColor="FCE4D6")
     comp_font = Font(bold=True, size=11, color="1F4E78")

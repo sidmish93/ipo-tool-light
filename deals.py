@@ -3,7 +3,9 @@
 A quarterly SHP is as-of the quarter-end date (June SHP = through 30 June).
 Disclosed NSE/BSE block and bulk trades from the next calendar day through
 today are applied in share counts: sells subtract, buys add. Adjusted % is
-adjusted shares / shares outstanding.
+adjusted shares / A+B+C2, the base of BSE's printed percentage. Shares
+outstanding is the Grand Total, A+B+C. Inverting a rounded percentage is
+only a fallback when that total is missing.
 
 Bulk and block feeds often describe the same client-day, so block quantity
 is counted once and only leftover bulk is added (same rule as blocks_tracker).
@@ -130,8 +132,15 @@ def _num(value):
         return 0.0
 
 
+def _as_shares(value):
+    n = _num(value)
+    if n <= 0:
+        return None
+    return int(round(n))
+
+
 def implied_outstanding(holders):
-    """Median shares / (pct/100) from named holders with a real stake."""
+    """Fallback only. Median shares / (pct/100) from rounded BSE percentages."""
     estimates = []
     for h in holders or []:
         shares = h.get("shares")
@@ -271,7 +280,7 @@ def net_positions(legs):
     return nets
 
 
-def apply_adjustments(holders, nets, outstanding, mcap):
+def apply_adjustments(holders, nets, outstanding, mcap, pct_base=None):
     """Mutate holder dicts; return extra rows for unmatched post-SHP activity."""
     holders = holders or []
     used = set()
@@ -288,7 +297,7 @@ def apply_adjustments(holders, nets, outstanding, mcap):
         match["sold"] = match.get("sold", 0) + rec["sold"]
 
     for h in holders + extras:
-        _finish_holder(h, outstanding, mcap)
+        _finish_holder(h, outstanding, mcap, pct_base)
     # Tape-only names start at 0 on the SHP. Keep a net buy only if the
     # implied stake is at least 0.5%. Adj book is unknown, so do not
     # invent shares / % / Rs cr. Drop net sells. Named holders stay.
@@ -327,7 +336,7 @@ def _new_tape_row(rec, outstanding, mcap):
     }
 
 
-def _finish_holder(h, outstanding, mcap):
+def _finish_holder(h, outstanding, mcap, pct_base=None):
     shares = _num(h.get("shares"))
     bought = _num(h.get("bought"))
     sold = _num(h.get("sold"))
@@ -346,8 +355,11 @@ def _finish_holder(h, outstanding, mcap):
         h["adj_pct"] = h.get("pct")
         h["adj_holding_cr"] = h.get("holding_cr")
         return
-    if outstanding:
-        h["adj_pct"] = round(adj * 100.0 / outstanding, 4)
+    # BSE's printed % is of A+B+C2. Keep a post-SHP % on that same base.
+    # `outstanding` is the Grand Total, A+B+C, which also includes C1.
+    base = pct_base or outstanding
+    if base:
+        h["adj_pct"] = round(adj * 100.0 / base, 4)
     else:
         h["adj_pct"] = None
     h["adj_holding_cr"] = _rupee_holding(h.get("adj_pct"), mcap)
@@ -478,10 +490,11 @@ def fetch_bse_legs(bpage, scripcode, start, end):
     return legs
 
 
-def adjust_holders(holders, legs, qname, mcap):
+def adjust_holders(holders, legs, qname, mcap, outstanding=None, pct_base=None):
     """Apply already-fetched deal legs. Returns (holders, extras, meta)."""
     start, end = adjust_window(qname)
-    outstanding = implied_outstanding(holders)
+    outstanding = _as_shares(outstanding) or implied_outstanding(holders)
+    pct_base = _as_shares(pct_base) or outstanding
     meta = {
         "quarter_end": start - datetime.timedelta(days=1) if start else None,
         "adjust_from": start,
@@ -492,19 +505,19 @@ def adjust_holders(holders, legs, qname, mcap):
     }
     if not start or not end or start > end:
         for h in holders:
-            _finish_holder(h, outstanding, mcap)
+            _finish_holder(h, outstanding, mcap, pct_base)
         return holders, [], meta
     meta["deal_legs"] = len(legs or [])
     nets = net_positions(legs or [])
-    extras = apply_adjustments(holders, nets, outstanding, mcap)
+    extras = apply_adjustments(holders, nets, outstanding, mcap, pct_base)
     meta["matched_clients"] = sum(
         1 for h in holders if _num(h.get("bought")) or _num(h.get("sold"))
     )
-    meta["shares_outstanding"] = implied_outstanding(holders) or outstanding
     return holders, extras, meta
 
 
-def fetch_and_adjust(bpage, npage, nse_symbol, scripcode, qname, holders, mcap):
+def fetch_and_adjust(bpage, npage, nse_symbol, scripcode, qname, holders, mcap,
+                     outstanding=None, pct_base=None):
     """Apply post-SHP deals to holders. Returns (holders, extras, meta)."""
     start, end = adjust_window(qname)
     legs = []
@@ -517,4 +530,4 @@ def fetch_and_adjust(bpage, npage, nse_symbol, scripcode, qname, holders, mcap):
             legs.extend(fetch_bse_legs(bpage, scripcode, start, end))
         except Exception:
             pass
-    return adjust_holders(holders, legs, qname, mcap)
+    return adjust_holders(holders, legs, qname, mcap, outstanding, pct_base)
