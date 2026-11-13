@@ -323,6 +323,11 @@ async function doSearch(){
       $("#lookStatus").textContent = "No companies to look up.";
       return;
     }
+    const crashed = rows.filter(r => r.error && !r.found);
+    if(!d.found_count && crashed.length){
+      $("#lookStatus").textContent = crashed.map(r => r.error).join("; ");
+      return;
+    }
     const missing = d.missing || [];
     const found = d.found_count || 0;
     $("#lookStatus").textContent = missing.length

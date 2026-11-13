@@ -47,6 +47,16 @@ def _lookup_key(q):
     return ";".join(t.lower() for t in split_terms(q))
 
 
+def _browser_error(exc):
+    msg = str(exc)
+    low = msg.lower()
+    if ("connection closed" in low or "reading from the driver" in low
+            or "has been closed" in low or "target closed" in low):
+        return ("Chrome ran out of memory on this 512 MB server and closed. "
+                "Wait a few seconds and search again.")
+    return msg
+
+
 def _found_companies(results):
     return [r for r in (results or []) if r.get("found")]
 
@@ -94,8 +104,8 @@ def _worker(from_str, to_str, mcap_min):
         _job["cancelled"] = True
         _progress("Cancelled.")
     except Exception as e:
-        _job["error"] = str(e)
-        _progress("ERROR: " + str(e))
+        _job["error"] = _browser_error(e)
+        _progress("ERROR: " + _job["error"])
         traceback.print_exc()
     finally:
         _job["finished"] = True
@@ -159,7 +169,7 @@ def company():
         results = lookup_company(q)
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": _browser_error(e)}), 500
     finally:
         _gate.release()
     _last_lookup["key"] = _lookup_key(q)
@@ -194,7 +204,7 @@ def company_xlsx():
             results = lookup_company(q)
         except Exception as e:
             traceback.print_exc()
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": _browser_error(e)}), 500
         finally:
             _gate.release()
         _last_lookup["key"] = key

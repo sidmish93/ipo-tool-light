@@ -19,6 +19,7 @@ import time
 import datetime
 import urllib.parse
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -26,7 +27,11 @@ from openpyxl.utils import get_column_letter
 
 from deals import (
     ADJ_UNDETERMINED,
+    adjust_holders,
+    adjust_window,
     fetch_and_adjust,
+    fetch_bse_legs,
+    fetch_nse_legs,
     quarter_end as _quarter_end_date,
 )
 
@@ -59,7 +64,6 @@ _LOW_MEM_ARGS = [
     "--no-default-browser-check",
     "--disk-cache-size=1",
     "--media-cache-size=1",
-    "--js-flags=--max-old-space-size=96",
     "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,"
     "OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process",
 ]
@@ -174,10 +178,13 @@ def _browser_args():
 def _block_heavy_resources(ctx):
     """Drop images, fonts, and media. JSON fetches do not need them."""
     def _handle(route):
-        if route.request.resource_type in ("image", "media", "font"):
-            route.abort()
-        else:
-            route.continue_()
+        try:
+            if route.request.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            pass
     ctx.route("**/*", _handle)
 
 
@@ -213,6 +220,7 @@ def _new_context(browser):
         viewport={"width": 1100 if low else 1440, "height": 700 if low else 900},
         locale="en-IN",
         extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"},
+        **({"service_workers": "block"} if low else {}),
     )
     if low:
         _block_heavy_resources(ctx)
@@ -246,14 +254,21 @@ def _bse_reachable(ctx) -> bool:
             pass
 
 
-def _open_session(playwright):
+def _driver_died(exc):
+    msg = str(exc).lower()
+    return ("connection closed" in msg or "target closed" in msg
+            or "has been closed" in msg or "reading from the driver" in msg)
+
+
+def _open_session(playwright, probe=True):
     """Launch a browser that BSE will actually talk to.
 
-    Returns (browser, context, label).
+    Returns (browser, context, label). probe=False skips the extra BSE
+    tab so a 512 MB instance only has the page the lookup itself opens.
     """
     errors = []
     if _low_memory():
-        print("Low-memory browser mode (512 MB): one Chrome renderer, "
+        print("Low-memory browser mode (512 MB): one Chrome page at a time, "
               "images/fonts/media blocked.", flush=True)
     for spec in _browser_specs():
         try:
@@ -262,7 +277,7 @@ def _open_session(playwright):
             errors.append(f"{spec['label']}: could not start ({e})")
             continue
         ctx = _new_context(browser)
-        if _bse_reachable(ctx):
+        if not probe or _bse_reachable(ctx):
             return browser, ctx, spec["label"]
         try:
             ctx.close()
@@ -937,9 +952,125 @@ class Pipeline:
             public = list(public) + extras
         return promoters, public, meta
 
+    def _switch(self, page, home):
+        """Open `home` only when this single page is not already there."""
+        host = urllib.parse.urlparse(home).netloc
+        try:
+            current = page.url or ""
+        except Exception:
+            current = ""
+        if host not in current:
+            page.goto(home, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(700)
+
+    def _record_one(self, page, name):
+        """One company, one page: finish BSE, then move that page to NSE.
+
+        Keeping both exchange sites open is what blows a 512 MB instance
+        and closes the Playwright driver mid-search.
+        """
+        self._switch(page, "https://www.bseindia.com/")
+        if _bse_blocked(page):
+            return {"found": False, "query": name,
+                    "error": "BSE blocked the browser"}
+        info = self._bse_lookup(page, name)
+        if not info or not info["scripcode"]:
+            return {"found": False, "query": name}
+
+        mcap = self._bse_mcap(page, info["scripcode"])
+        qtr = self._bse_quarter(page, info["scripcode"])
+        promoters, public, prom_url, pub_url, quarter = [], [], "", "", ""
+        meta = {}
+        bse_legs = []
+        start = end = None
+        if qtr:
+            quarter = _display_quarter(qtr["qname"])
+            prom_url, pub_url = self._stmt_urls(
+                info["scripcode"], qtr["qid"], qtr["qname"])
+            promoters = _with_holdings(
+                self._promoter_rows(page, info["scripcode"], qtr["qid"]), mcap)
+            public = _with_holdings(
+                self._public_rows(page, info["scripcode"], qtr["qid"]), mcap)
+            start, end = adjust_window(qtr["qname"])
+            if start and end and start <= end:
+                try:
+                    bse_legs = fetch_bse_legs(
+                        page, info["scripcode"], start, end)
+                except Exception:
+                    bse_legs = []
+
+        nse = info["ticker"]
+        nse_legs = []
+        try:
+            self._switch(page, "https://www.nseindia.com/")
+            nse = self._nse_ticker(page, info["bse_name"],
+                                   info["bse_name"], info["ticker"])
+            if start and end and start <= end and nse:
+                nse_legs = fetch_nse_legs(page, nse, start, end)
+        except Exception:
+            nse_legs = []
+
+        if qtr:
+            promoters, public, meta = self._apply_legs(
+                promoters, public, list(bse_legs) + list(nse_legs),
+                qtr["qname"], mcap)
+
+        return {
+            "found": True,
+            "query": name,
+            "name": info["bse_name"],
+            "bse_ticker": info["ticker"],
+            "scripcode": info["scripcode"],
+            "nse_ticker": nse,
+            "isin": info["isin"],
+            "mcap": mcap,
+            "quarter": quarter,
+            "quarter_end": _iso(meta.get("quarter_end") or (qtr.get("as_of") if qtr else None)),
+            "adjust_from": _iso(meta.get("adjust_from")),
+            "adjust_to": _iso(meta.get("adjust_to")),
+            "shares_outstanding": meta.get("shares_outstanding"),
+            "prom_url": prom_url,
+            "pub_url": pub_url,
+            "promoters": promoters,
+            "public": public,
+        }
+
+    def _apply_legs(self, promoters, public, legs, qname, mcap):
+        holders = list(promoters) + list(public)
+        _, extras, meta = adjust_holders(holders, legs, qname, mcap)
+        if extras:
+            public = list(public) + extras
+        return promoters, public, meta
+
+    def _lookup_many_light(self, terms):
+        """Search with one Chrome page. BSE and NSE are never open together."""
+        out = []
+        with sync_playwright() as p:
+            browser, ctx, label = _open_session(p, probe=False)
+            self.log(f"Browser: {label}", stage="bse")
+            try:
+                page = ctx.new_page()
+                total = len(terms)
+                for i, name in enumerate(terms, 1):
+                    self.log(f"[{i}/{total}] {name}", current=i, total=total,
+                             stage="bse")
+                    out.append(self._record_one(page, name))
+                return out
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
     # ----- orchestration -------------------------------------------------- #
     def run(self, dfrom, dto, out_path, mcap_min=None):
         threshold = MCAP_THRESHOLD if mcap_min is None else float(mcap_min)
+        if _low_memory():
+            return self._run_light(dfrom, dto, out_path, threshold)
         qualified = []
         with sync_playwright() as p:
             self._check_cancel()
@@ -1046,6 +1177,63 @@ class Pipeline:
         self.log(f"Done. {len(qualified)} companies written.", stage="done")
         return qualified
 
+    def _run_light(self, dfrom, dto, out_path, threshold):
+        """Same workbook as run(), but Chrome only has one page open."""
+        qualified = []
+        with sync_playwright() as p:
+            self._check_cancel()
+            browser, ctx, label = _open_session(p, probe=False)
+            self.log(f"Browser: {label}", stage="list")
+            try:
+                page = ctx.new_page()
+                self.log("Fetching mainboard IPOs by listing date "
+                         "(Chittorgarh)...", stage="list")
+                companies = self._listed_companies(page, dfrom, dto)
+                self.log(f"Found {len(companies)} listed IPOs in range.",
+                         stage="list")
+                self.log(f"Keeping companies with mcap > {threshold:.0f} cr.",
+                         stage="bse")
+                total = len(companies)
+                for i, (name, _dt) in enumerate(companies, 1):
+                    self._check_cancel()
+                    self.log(f"[{i}/{total}] {name}", current=i, total=total,
+                             stage="bse")
+                    rec = self._record_one(page, name)
+                    if rec.get("error") and not rec.get("found"):
+                        self.log(f"    {rec['error']}", stage="bse")
+                    if not rec.get("found"):
+                        self.log("    not found on BSE, skipping", stage="bse")
+                        continue
+                    mcap = rec.get("mcap")
+                    if mcap is None or mcap <= threshold:
+                        self.log(f"    Mcap {mcap} <= {threshold:.0f}cr, skipping",
+                                 stage="bse")
+                        continue
+                    if not rec.get("quarter"):
+                        self.log("    no shareholding quarter, skipping", stage="bse")
+                        continue
+                    rec["name"] = name
+                    qualified.append(rec)
+                    self.log(f"    QUALIFIED  Mcap {mcap:,.2f}cr  {rec.get('bse_ticker')}  "
+                             f"(promoters={len(rec.get('promoters') or [])}, "
+                             f"public={len(rec.get('public') or [])})",
+                             stage="bse")
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        self.log("Writing Excel workbook...", stage="excel")
+        cut = int(threshold) if threshold == int(threshold) else threshold
+        _write_workbook(qualified, out_path,
+                        sheet1_title=f"IPO Companies >{cut}cr")
+        self.log(f"Done. {len(qualified)} companies written.", stage="done")
+        return qualified
+
     # ----- interactive search (one or many names, semicolon-separated) --- #
     def _lookup_on_pages(self, bpage, npage, name):
         """Resolve one name against pages already opened on BSE / NSE."""
@@ -1106,6 +1294,16 @@ class Pipeline:
         terms = names if isinstance(names, (list, tuple)) else split_terms(names)
         if not terms:
             return []
+        if _low_memory():
+            try:
+                return self._lookup_many_light(terms)
+            except PlaywrightError as exc:
+                if not _driver_died(exc):
+                    raise
+                raise RuntimeError(
+                    "Chrome ran out of memory on this 512 MB server and closed. "
+                    "Wait a few seconds and search again."
+                ) from exc
         with sync_playwright() as p:
             browser, ctx, _label = _open_session(p)
             try:

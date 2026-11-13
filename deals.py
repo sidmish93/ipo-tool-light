@@ -478,8 +478,8 @@ def fetch_bse_legs(bpage, scripcode, start, end):
     return legs
 
 
-def fetch_and_adjust(bpage, npage, nse_symbol, scripcode, qname, holders, mcap):
-    """Apply post-SHP deals to holders. Returns (holders, extras, meta)."""
+def adjust_holders(holders, legs, qname, mcap):
+    """Apply already-fetched deal legs. Returns (holders, extras, meta)."""
     start, end = adjust_window(qname)
     outstanding = implied_outstanding(holders)
     meta = {
@@ -494,24 +494,27 @@ def fetch_and_adjust(bpage, npage, nse_symbol, scripcode, qname, holders, mcap):
         for h in holders:
             _finish_holder(h, outstanding, mcap)
         return holders, [], meta
-
-    legs = []
-    try:
-        legs.extend(fetch_nse_legs(npage, nse_symbol, start, end))
-    except Exception:
-        pass
-    try:
-        legs.extend(fetch_bse_legs(bpage, scripcode, start, end))
-    except Exception:
-        pass
-    meta["deal_legs"] = len(legs)
-    nets = net_positions(legs)
+    meta["deal_legs"] = len(legs or [])
+    nets = net_positions(legs or [])
     extras = apply_adjustments(holders, nets, outstanding, mcap)
     meta["matched_clients"] = sum(
         1 for h in holders if _num(h.get("bought")) or _num(h.get("sold"))
     )
-    if outstanding and not meta["shares_outstanding"]:
-        meta["shares_outstanding"] = outstanding
-    else:
-        meta["shares_outstanding"] = implied_outstanding(holders) or outstanding
+    meta["shares_outstanding"] = implied_outstanding(holders) or outstanding
     return holders, extras, meta
+
+
+def fetch_and_adjust(bpage, npage, nse_symbol, scripcode, qname, holders, mcap):
+    """Apply post-SHP deals to holders. Returns (holders, extras, meta)."""
+    start, end = adjust_window(qname)
+    legs = []
+    if start and end and start <= end:
+        try:
+            legs.extend(fetch_nse_legs(npage, nse_symbol, start, end))
+        except Exception:
+            pass
+        try:
+            legs.extend(fetch_bse_legs(bpage, scripcode, start, end))
+        except Exception:
+            pass
+    return adjust_holders(holders, legs, qname, mcap)
