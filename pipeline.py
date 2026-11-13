@@ -52,7 +52,12 @@ _BROWSER_ARGS = [
 # One renderer and no site-isolation keeps BSE + NSE from spawning a
 # process each. Images are blocked separately in the browser context.
 _LOW_MEM_ARGS = [
+    # One process. A normal Chrome launch is several processes and
+    # does not fit in Render's 512 MB alongside Python.
+    "--single-process",
+    "--no-zygote",
     "--renderer-process-limit=1",
+    "--disable-software-rasterizer",
     "--disable-background-networking",
     "--disable-sync",
     "--disable-default-apps",
