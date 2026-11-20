@@ -1,0 +1,52 @@
+name: ECM deal alerts
+
+# Filings land outside market hours, so this asks for every 10 minutes all week.
+# GitHub's scheduler delays runs and sometimes drops them. A plain every-10-minutes
+# cron gives a dropped run another chance, and a public repository is not billed
+# for the minutes. A run with nothing new finishes in a few seconds.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: deal-news
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Poll deal feeds
+        env:
+          DEAL_BOT_TOKEN: ${{ secrets.DEAL_BOT_TOKEN }}
+          DEAL_CHAT_ID: ${{ secrets.DEAL_CHAT_ID }}
+        run: python -m newsbot.deal_bot --once
+
+      # Each run is a fresh machine. The seen-list has to come back with the
+      # repository or the next run would send the same filings again. The
+      # heartbeat changes once a day so GitHub does not disable the schedule
+      # after 60 days without other commits.
+      - name: Persist seen deals
+        run: |
+          date -u +%Y-%m-%d > newsbot/state/heartbeat.txt
+          if [ -n "$(git status --porcelain newsbot/state)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add newsbot/state
+            git commit -m "Deal bot state: $(date -u +%Y-%m-%d\ %H:%M) UTC [skip ci]"
+            for attempt in 1 2 3; do
+              git pull --rebase --autostash -q && git push -q && break
+              sleep 5
+            done
+          fi
