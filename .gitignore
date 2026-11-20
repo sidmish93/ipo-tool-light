@@ -4,4 +4,3 @@ __pycache__/
 venv/
 .env
 output/*.xlsx
-newsbot/state/*.tmp
